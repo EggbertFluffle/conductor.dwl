@@ -1,0 +1,308 @@
+diff --git a/Makefile b/Makefile
+index 578194f..5daba32 100644
+--- a/Makefile
++++ b/Makefile
+@@ -17,11 +17,12 @@ DWLCFLAGS = `$(PKG_CONFIG) --cflags $(PKGS)` $(WLR_INCS) $(DWLCPPFLAGS) $(DWLDEV
+ LDLIBS    = `$(PKG_CONFIG) --libs $(PKGS)` $(WLR_LIBS) -lm $(LIBS)
+ 
+ all: dwl
+-dwl: dwl.o util.o
+-	$(CC) dwl.o util.o $(DWLCFLAGS) $(LDFLAGS) $(LDLIBS) -o $@
++dwl: dwl.o util.o cJSON.o
++	$(CC) dwl.o util.o cJSON.o $(DWLCFLAGS) $(LDFLAGS) $(LDLIBS) -o $@
+ dwl.o: dwl.c client.h config.h config.mk cursor-shape-v1-protocol.h \
+ 	pointer-constraints-unstable-v1-protocol.h wlr-layer-shell-unstable-v1-protocol.h \
+ 	wlr-output-power-management-unstable-v1-protocol.h xdg-shell-protocol.h
++cJSON.o: cJSON.c cJSON.h
+ util.o: util.c util.h
+ 
+ # wayland-scanner is a tool which generates C headers and rigging for Wayland
+diff --git a/config.def.h b/config.def.h
+index 8a6eda0..dbea9d7 100644
+--- a/config.def.h
++++ b/config.def.h
+@@ -27,9 +27,15 @@ static const Rule rules[] = {
+     /* default/example rule: can be changed but cannot be eliminated; at least one rule must exist */
+ };
+ 
++const char* CONDUCTOR_BIN_PATH = "conductor";
++const char* CONDUCTOR_STARTING_VARIABLE = "start";
++const char* CONDUCTOR_SNIPPET = "start = full [|] ?stack\\nstack = full (-) stack";
++const double CONDUCTOR_MAX_DEPTH = 25.0;
++
+ /* layout(s) */
+ static const Layout layouts[] = {
+ 	/* symbol     arrange function */
++	{ "CON",      conductor },
+ 	{ "[]=",      tile },
+ 	{ "><>",      NULL },    /* no layout function means floating behavior */
+ 	{ "[M]",      monocle },
+diff --git a/dwl.c b/dwl.c
+index 101a45f..e5ed217 100644
+--- a/dwl.c
++++ b/dwl.c
+@@ -70,6 +70,7 @@
+ #endif
+ 
+ #include "util.h"
++#include "cJSON.h"
+ 
+ /* macros */
+ #define MAX(A, B)               ((A) > (B) ? (A) : (B))
+@@ -335,6 +336,7 @@ static void startdrag(struct wl_listener *listener, void *data);
+ static void tag(const Arg *arg);
+ static void tagmon(const Arg *arg);
+ static void tile(Monitor *m);
++static void conductor(Monitor *m);
+ static void togglefloating(const Arg *arg);
+ static void togglefullscreen(const Arg *arg);
+ static void toggletag(const Arg *arg);
+@@ -2745,6 +2747,248 @@ tile(Monitor *m)
+ 	}
+ }
+ 
++char*
++get_send_packet(Monitor *m)
++{
++	printf("start send packet\n");
++
++	Client *c;
++
++	cJSON* send_packet = NULL;
++	cJSON* window_ids = NULL;
++	cJSON* id = NULL;
++	cJSON* screen_size = NULL;
++
++	send_packet = cJSON_CreateObject();
++	if(send_packet == NULL) 
++		goto release;
++
++	// Add max_depth
++	if(cJSON_AddNumberToObject(send_packet, "max_depth", CONDUCTOR_MAX_DEPTH) == NULL)
++		goto release;
++
++	// Add starting_variable
++	if(cJSON_AddStringToObject(send_packet, "starting_variable", CONDUCTOR_STARTING_VARIABLE) == NULL)
++		goto release;
++
++	// Add window_ids
++	window_ids = cJSON_AddArrayToObject(send_packet, "window_ids");
++	if(window_ids == NULL)
++		goto release;
++
++	wl_list_for_each(c, &clients, link) {
++		if (!VISIBLEON(c, m) || c->isfloating || c->isfullscreen)
++			continue;
++
++		char buf[64];
++		sprintf(buf, "%ld", (long)&(c->link));
++		id = cJSON_CreateString(buf);
++		if(id == NULL)
++			goto release;
++
++		cJSON_AddItemToArray(window_ids, id);
++	}
++
++	// Add screen size
++	screen_size = cJSON_CreateObject();
++	if(screen_size == NULL) 
++		goto release;
++	cJSON_AddItemToObject(send_packet, "screen_size", screen_size);
++	if(cJSON_AddNumberToObject(screen_size, "x", (double)m->m.x) == NULL)
++		goto release;
++	if(cJSON_AddNumberToObject(screen_size, "y", (double)m->m.y) == NULL)
++		goto release;
++	if(cJSON_AddNumberToObject(screen_size, "width", (double)m->m.width) == NULL)
++		goto release;
++	if(cJSON_AddNumberToObject(screen_size, "height", (double)m->m.height) == NULL)
++		goto release;
++
++	// Add params list
++	if(cJSON_AddArrayToObject(send_packet, "params") == NULL)
++		goto release;
++
++	// Add snippet
++	if(cJSON_AddStringToObject(send_packet, "snippet", CONDUCTOR_SNIPPET) == NULL)
++		goto release;
++
++	return cJSON_Print(send_packet);
++
++release:
++	printf("Error releasing in get_send_packet\n");
++
++	if(screen_size != NULL)
++		cJSON_Delete(screen_size);
++	if(id != NULL)
++		cJSON_Delete(id);
++	return NULL;
++}
++
++typedef struct {
++	char* id;
++	int x;
++	int y;
++	int width;
++	int height;
++} Placement;
++
++int
++get_receive_packet(char* send_packet, Placement** placement_list)
++{
++	char* buf = NULL;
++	FILE* conductor_prog = NULL;
++	cJSON* receive_packet = NULL;
++	cJSON* placements = NULL;
++
++	cJSON* curr_placement = NULL;
++	cJSON* curr_id = NULL;
++	cJSON* curr_transform = NULL;
++
++	cJSON* curr_x = NULL;
++	cJSON* curr_y = NULL;
++	cJSON* curr_width = NULL;
++	cJSON* curr_height = NULL;
++
++	int placements_len = 0;
++
++	size_t buf_len = sizeof(char) * strlen(send_packet) * 2;
++	buf = (char*)malloc(buf_len);
++
++	sprintf(buf, "echo '%s' | %s", send_packet, CONDUCTOR_BIN_PATH);
++	conductor_prog = popen(buf, "r");
++	if(conductor_prog == NULL)
++		goto release;
++
++	// Read from conductor process
++	memset(buf, 0, buf_len);
++	fread(buf, sizeof(char), buf_len, conductor_prog);
++
++	pclose(conductor_prog); 
++	conductor_prog = NULL;
++
++	receive_packet = cJSON_Parse(buf);
++	if(receive_packet == NULL)
++		goto release;
++
++	printf("receive_packet: %s\n", buf);
++
++	placements = cJSON_GetObjectItem(receive_packet, "placements");
++	if(placements == NULL || placements->type != cJSON_Array)
++		goto release;
++
++	placements_len = cJSON_GetArraySize(placements);
++
++	*placement_list = malloc(sizeof(Placement) * placements_len);
++	if(*placement_list == NULL)
++		goto release;
++
++
++	for(int i = 0; i < placements_len; i++) {
++		curr_placement = cJSON_GetArrayItem(placements, i);
++		if(curr_placement == NULL || curr_placement->type != cJSON_Object)
++			goto release;
++
++		curr_id = cJSON_GetObjectItem(curr_placement, "id");
++		if(curr_id == NULL || curr_id->type != cJSON_String)
++			goto release;
++
++		curr_transform = cJSON_GetObjectItem(curr_placement, "transform");
++		if(curr_transform == NULL || curr_transform->type != cJSON_Object)
++			goto release;
++
++		curr_x = cJSON_GetObjectItem(curr_transform, "x");
++		if(curr_x == NULL)
++			goto release;
++		curr_y = cJSON_GetObjectItem(curr_transform, "y");
++		if(curr_y == NULL)
++			goto release;
++		curr_width = cJSON_GetObjectItem(curr_transform, "width");
++		if(curr_width == NULL)
++			goto release;
++		curr_height = cJSON_GetObjectItem(curr_transform, "height");
++		if(curr_height == NULL)
++			goto release;
++
++		(*placement_list)[i] = (Placement){
++			.id = cJSON_GetStringValue(curr_id),
++			.x = (int)cJSON_GetNumberValue(curr_x),
++			.y = (int)cJSON_GetNumberValue(curr_y),
++			.width = (int)cJSON_GetNumberValue(curr_width),
++			.height = (int)cJSON_GetNumberValue(curr_height)
++		};
++	}
++
++	return placements_len;
++
++release:
++	printf("Error releasing in get_receive_packet\n");
++
++	// if(send_packet != NULL)
++	// 	free(send_packet);
++
++	if(conductor_prog != NULL)
++		pclose(conductor_prog);
++
++	if(receive_packet != NULL)
++		cJSON_Delete(receive_packet);
++
++	if(placement_list == NULL) {
++		free(*placement_list);
++		*placement_list = NULL;
++	}
++
++	return 0;
++}
++
++void
++conductor(Monitor *m)
++{
++	char* send_packet = NULL;
++	Placement* placements = NULL;
++	int placements_len = 0;
++	Client* c = NULL;
++
++	send_packet = get_send_packet(m);
++	if(send_packet == NULL)
++		goto release;
++
++	placements_len = get_receive_packet(send_packet, &placements);
++	if(placements == NULL)
++		goto release;
++
++	struct wlr_box transform;
++	wl_list_for_each(c, &clients, link) {
++		if (!VISIBLEON(c, m) || c->isfloating || c->isfullscreen)
++			continue;
++
++		for(int i = 0; i < placements_len; i++) {
++			char buf[64];
++			sprintf(buf, "%ld", (long)&(c->link));
++
++			if(memcmp(buf, placements[i].id, strlen(buf)) != 0)
++				continue;
++
++			transform = (struct wlr_box){
++				.x = m->w.x + placements[i].x, 
++				.y = m->w.y + placements[i].y,
++				.width = placements[i].width,
++				.height = placements[i].height
++			};
++			resize(c, transform, 0);
++		}
++	}
++
++	return;
++
++release:
++	printf("Error releasing in conductor\n");
++
++	if(send_packet != NULL)
++		free(send_packet);
++
++	if(placements != NULL)
++		free(placements);
++}
++
+ void
+ togglefloating(const Arg *arg)
+ {
