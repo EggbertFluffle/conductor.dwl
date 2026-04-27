@@ -7,7 +7,7 @@ Conductor.dwl is an implementation of the [Conductor](https://github.com/Eggbert
 This plugin is for [dwl](https://codeberg.org/dwl/dwl). Once you have your dwl source code, patch the `conductor.diff` to your source. You will also need the [Conductor](https://github.com/EggbertFluffle/Conductor) binary built for your system. We do not package prebuilt binaries.
 
 ```sh
-curl {URL_GOES_HERE} ./conductor.diff
+curl https://raw.githubusercontent.com/EggbertFluffle/conductor.dwl/refs/heads/main/conductor.diff ./conductor.diff
 patch < conductor.diff
 make clean install
 ```
